@@ -1,0 +1,187 @@
+#!/bin/bash
+
+set -o nounset
+set -o errexit
+
+# Set Git sources
+UPDATE_URI="https://github.com/mobileappsystems/protoplc-update/raw/master/protoplc-update"
+REPO_URI=${REPO_URI:-"https://github.com/mobileappsystems/protoplc-bsp"}
+
+# Setting paths is all or none
+if [[ ${ROOT_PATH:-"unset"} == "unset" && ${MAS_PATH:-"unset"} != "unset" ]] ||
+[[ ${ROOT_PATH:-"unset"} != "unset" && ${MAS_PATH:-"unset"} == "unset" ]]; then
+	echo " *** You need to specify both ROOT_PATH and MAS_PATH, or neither"
+	exit 1
+fi
+
+# Set default paths
+ROOT_PATH=${ROOT_PATH:-"/"}
+MAS_PATH=${MAS_PATH:-"/usr/local/mas"}
+WORK_PATH=${WORK_PATH:-"${ROOT_PATH}/root"}
+
+# Set installation options
+UPDATE_SELF=${UPDATE_SELF:-1}
+BRANCH=${BRANCH:-"master"}
+SKIP_REPODELETE=${SKIP_REPODELETE:-0}
+SKIP_BACKUP=${SKIP_BACKUP:-0}
+SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}
+
+# BSP repo setup
+BSP_REPO="${REPO_URI}.git"
+BSP_REPOLOCAL=${BSP_REPOLOCAL:-"${WORK_PATH}/.protoplc-bsp"}
+BSP_PATH="${MAS_PATH}/protoplc/bsp"
+BSP_REV=${1:-""}
+BSP_REVFILE="${BSP_PATH}/.bsp_revision"
+
+# Update the 'protoplc-update' tool itself
+function update_self() {
+	echo " *** Performing self-update"
+	_tempFileName="$0.tmp"
+
+	if ! curl -L --output "${_tempFileName}" "${UPDATE_URI}"; then
+		echo " !!! Failed to download update for protoplc-update!"
+		echo " !!! Make sure you have ca-certificates installed and that the time is set correctly"
+		exit 1
+	fi
+
+	OCTAL_MODE=$(stat -c '%a' "$0")
+	if ! chmod ${OCTAL_MODE} "${_tempFileName}" ; then
+		echo " !!! Failed: Error while trying to set mode on ${_tempFileName}"
+		exit 1
+	fi
+
+	cat > "${WORK_PATH}/.updateScript.sh" << EOF
+	if mv "${_tempFileName}" "$0"; then
+		rm -- "\$0"
+		exec env UPDATE_SELF=0 /bin/bash "$0" "${BSP_REV}"
+	else
+		echo " !!! Failed!"
+	fi
+EOF
+
+	echo " *** Relaunching after update"
+	exec /bin/bash "${WORK_PATH}/.updateScript.sh"
+}
+
+# Update the ProtoPLC BSP files
+function update_bsp {
+	echo " *** Updating BSP"
+	rm -rf "${BSP_PATH}/"*
+	cp -R "${BSP_REPOLOCAL}/"* "${BSP_PATH}/"
+}
+
+# Finalize the update
+function finalize {
+	echo " *** Updating ProtoPLC firmware"
+	source "${BSP_PATH}/firmware/update"
+
+	echo " *** Storing current BSP revision"
+	echo "${BSP_REV}" > "${BSP_REVFILE}"
+}
+
+# Backup BSP files
+function do_backup {
+	if [[ ${SKIP_BACKUP} -eq 0 ]]; then
+		echo " *** Backing up files"
+		if [[ -d "${BSP_PATH}.bak" ]]; then
+			echo " *** Remove old BSP backup"
+			rm -rf "${BSP_PATH}.bak"
+		fi
+		echo " *** Backing up BSP"
+		cp -a "${BSP_PATH}" "${BSP_PATH}.bak"
+	fi
+}
+
+# Update the ProtoPLC BSP
+function do_update {
+	download_rev
+	if [[ -f "${BSP_REPOLOCAL}/pre-install" ]]; then
+		echo " *** Running pre-install script"
+		source "${BSP_REPOLOCAL}/pre-install"
+	fi
+	update_bsp
+	finalize
+	if [[ -f "${BSP_REPOLOCAL}/post-install" ]]; then
+		echo " *** Running post-install script"
+		source "${BSP_REPOLOCAL}/post-install"
+	fi
+	remove_rev
+	echo " *** Syncing changes to disk"
+	sync
+	echo " *** If no errors appeared, your ProtoPLC BSP was successfully updated to ${BSP_REV}"
+}
+
+# Download repository
+function download_rev {
+	if [[ ${SKIP_DOWNLOAD} -eq 0 ]]; then
+		echo " *** Downloading specific firmware revision"
+		rm -rf "${BSP_REPOLOCAL}"
+		mkdir -p "${BSP_REPOLOCAL}"
+		curl -L "${REPO_URI}/tarball/${BSP_REV}" | tar xzf - -C "${BSP_REPOLOCAL}" --strip-components=1
+	fi
+}
+
+# Remove local repository
+function remove_rev {
+	if [[ ${SKIP_REPODELETE} -eq 0 ]]; then
+		echo " *** Deleting downloaded files"
+		rm -rf "${BSP_REPOLOCAL}"
+	fi
+}
+
+################################
+# The update process begins here
+################################
+
+# Must be root user
+if [[ ${EUID} -ne 0 ]]; then
+	echo " !!! This tool must be run as root"
+	exit 1
+fi
+
+echo " *** ProtoPLC Board Support Package from MobileApp Systems"
+
+# Update 'protoplc-update' if needed
+if [[ ${UPDATE_SELF} -ne 0 ]]; then
+	update_self
+fi
+
+# Create path(s) if necessary
+if [[ ! -d "${BSP_PATH}" ]]; then
+	echo " Creating ${BSP_PATH}"
+	mkdir -p "${BSP_PATH}"
+fi
+
+##############################
+# Check if BSP is current
+##############################
+
+# Source version is latest from Git if not specified on command line
+REPO_API=${REPO_URI/github.com/api.github.com\/repos}/git/refs/heads/${BRANCH}
+GITREV=$(curl -s ${REPO_API} | awk '{ if ($1 == "\"sha\":") { print substr($2, 2, 40) } }')
+BSP_REV=${BSP_REV:-${GITREV}}
+
+if [[ "${BSP_REV}" == "" ]]; then
+	echo " *** No hash received from github: ${REPO_API}"
+  # run again with errors not suppressed
+  curl ${REPO_API}
+  exit 1
+fi
+
+# Confirm installed version is outdated
+if [[ ! -f "${BSP_REVFILE}" ]]; then
+	echo " *** We're running for the first time"
+else
+	if [[ $(cat "${BSP_REVFILE}") == "$BSP_REV" ]]; then
+		echo " *** Your ProtoPLC BSP is already up to date"
+		exit 0
+	fi
+	# Backup the installed version
+	do_backup
+fi
+
+#########################
+# Initiate update process
+#########################
+
+do_update
